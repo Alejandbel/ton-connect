@@ -86,7 +86,6 @@ type DeviceInfo = {
   appVersion:  string; // e.g. "2.3.367"
   maxProtocolVersion: number;
   features: Feature[]; // list of supported features and methods in RPC
-                                // Currently there is only one feature -- 'SendTransaction'; 
 }
 
 type Feature =
@@ -98,6 +97,10 @@ type Feature =
   | {
       name: 'SignData';
       types: ('text' | 'binary' | 'cell')[]; // array of supported data types for signing
+    }
+  | {
+      name: 'SendInstantTransaction';
+      types: ('send-ton' | 'send-jetton' | 'send-nft' | 'send-action')[]; // list of supported instant transaction item types
     };
 
 type ConnectItemReply = TonAddressItemReply | TonProofItemReply ...;
@@ -374,6 +377,143 @@ interface SendTransactionResponseError {
 | 300  | User declined the transaction |
 | 400  | Method not supported       |
 
+
+#### Send instant transaction
+
+`sendInstantTransaction` is an alternative transfer flow built on top of deep links that allows a dApp to prepare a transaction and hand it over to a wallet **without requiring a prior TonConnect session**.
+
+```tsx
+interface SendInstantTransactionRequest {
+  id: string;
+  method: 'sendInstantTransaction';
+  params: [<instant-transaction-payload>];
+}
+```
+
+Where `<instant-transaction-payload>` is a JSON string with the following properties:
+
+* `id` (string, required): unique identifier of the instant transaction payload on the bridge.
+* `type` (string, required): MUST be equal to `"instant-tx"`.
+* `valid_until` (integer, optional): unix timestamp. After this moment the transaction will be considered invalid.
+* `network` (string, optional): the network (mainnet or testnet) where dApp intends to send the transaction. Semantics are the same as for `sendTransaction`.
+* `items` (array, required): ordered list of instant transaction items described by the `InstantTxMessage` type.
+
+`items` is an ordered list of payload fragments. Each item has a `type` field and additional fields depending on the kind:
+
+- **TON transfer (`send-ton`)**. JSON object with the following properties:
+  - **type** (string): MUST be equal to `'send-ton'`.
+  - **address** (string): message destination in user-friendly format.
+  - **amount** (string): number of nanocoins to send as a decimal string.
+  - **payload** (string, optional): raw one-cell BoC encoded in Base64.
+  - **state_init** (string, optional): raw one-cell BoC encoded in Base64.
+  - **extra_currency** (object, optional): extra currencies to send with the message (plain object `Record<string, string>`).
+
+- **Jetton transfer (`send-jetton`)**. JSON object with the following properties:
+  - **type** (string): MUST be equal to `'send-jetton'`.
+  - **master_address** (string): jetton master contract address (`master-address`).
+  - **query_id** (integer, optional): arbitrary request number.
+  - **jetton_amount** (string): amount of transferring jettons in elementary units.
+  - **destination** (string): address of the new owner of the jettons.
+  - **response_destination** (string, optional): address where to send a response with confirmation of a successful transfer and the rest of the incoming message Toncoins. If omitted, user's address MUST be used.
+  - **custom_payload** (string, optional): raw one-cell BoC encoded in Base64 custom data (used by either sender or receiver jetton wallet for inner logic).
+  - **forward_ton_amount** (string, optional): amount of nanotons to be sent to the destination address.
+  - **forward_payload** (string, optional): Base64-encoded custom data that should be sent to the destination address with notification.
+
+- **NFT transfer (`send-nft`)**. JSON object with the following properties:
+  - **type** (string): MUST be equal to `'send-nft'`.
+  - **query_id** (integer, optional): arbitrary request number.
+  - **new_owner** (string): address of the new owner of the NFT item.
+  - **response_destination** (string, optional): address where to send a response with confirmation of a successful transfer and the rest of the incoming message Toncoins. If omitted, user's address MUST be used.
+  - **custom_payload** (string, optional): raw one-cell BoC encoded in Base64 custom data (used by either sender or receiver NFT wallet for inner logic).
+  - **forward_ton_amount** (string, optional): amount of nanotons to be sent to the destination address.
+  - **forward_payload** (string, optional): Base64-encoded custom data that should be sent to the destination address with notification.
+
+- **Any action (`send-action`)**. JSON object with the following properties:
+  - **type** (string): MUST be equal to `'send-action'`.
+  - **action_url** (string): action URL; MUST be called with an `address` query parameter. MUST respond with <transaction-payload> object as in [`sendTransaction`](#sign-and-send-transaction) flow.
+
+**Examples:**
+
+```json5
+{
+  "id": "12314",
+  "type": "instant-tx",
+  "valid_until": 1764424242,
+  "network": "-239",
+  "items": [
+    {
+      "type": "send-ton",
+      "address": "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ",
+      "amount": "20000000"
+    }
+  ]
+}
+```
+
+```json5
+{
+  "id": "67890",
+  "type": "instant-tx",
+  "valid_until": 1764424242,
+  "network": "-3",
+  "items": [
+    {
+      "type": "send-jetton",
+      "master_address": "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
+      "jetton_amount": "1000000",
+      "destination": "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ",
+      "forward_ton_amount": "10000000"
+    },
+    {
+      "type": "send-action",
+      "action_url": "https://example.com/instant-tx?action=swap"
+    }
+  ]
+}
+```
+
+Flow:
+- The app generates its session key pair and the wallet's key pair.
+- The app constructs the instant transaction payload and encrypts it with the wallet public key as described in the [Session protocol](session.md#encryption).
+- The app computes the hash of the encrypted payload and uploads it to the central bridge (`https://connect.ton.org/bridge`) and optionally to the wallet-specific bridge when the user picks a particular wallet.
+- To hand off the request it generates a TonConnect deep link of the form  
+  `tc://message?id=<client_pub_key>&pk=<wallet_pk>&hash=<encrypted_payload_hash_hex>&bridge_url=<bridge_url>`, where:
+  - `id` is the app client ID (public key) encoded as hex.
+  - `pk` is the wallet private key encoded as hex.
+  - `hash` is the SHA256 hash of the encrypted payload, encoded as hex.
+  - `bridge_url` is the URL of the bridge where the encrypted payload was uploaded.
+- The wallet scans the link and connects to the bridge using the `id` and public key derived from `pk`.
+- The wallet waits for the bridge message with a payload with the corresponding hash.
+- The wallet decrypts the message as described in the [Session protocol](session.md#decryption).
+- The wallet generates and sends the signed message to the blockchain.
+
+The wallet responds with **SendInstantTransactionResponse**:
+
+```tsx
+type SendInstantTransactionResponse =
+  | SendInstantTransactionResponseSuccess
+  | SendInstantTransactionResponseError;
+
+interface SendInstantTransactionResponseSuccess {
+  result: string; // Message BoC
+  id: string;
+}
+
+interface SendInstantTransactionResponseError {
+  error: { code: number; message: string };
+  id: string;
+}
+```
+
+**Error codes:**
+
+| code | description                   |
+|------|-------------------------------|
+| 0    | Unknown error                 |
+| 1    | Bad request                   |
+| 100  | Unknown app                   |
+| 300  | User declined the transaction |
+| 400  | Method not supported          |
 
 #### Sign Data
 
